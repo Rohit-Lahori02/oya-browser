@@ -2,7 +2,8 @@
  * Unit tests for the admission middleware: a start is reserved before any
  * provider is called; a draining server, a refused reservation, a replay and a
  * queued start are answered here, and an admitted start goes on with its
- * reservation bound to the request and its outcome persisted.
+ * reservation bound to the request and its outcome persisted. A start that
+ * nothing can serve is refused before any session is reserved.
  */
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,6 +13,8 @@ ownDataDir('oya-control-admission-');
 const { admission } = await import('../../../../src/modules/control/admission.ts');
 const { control } = await import('../../../../src/modules/control/service.ts');
 const { registry } = await import('../../../../src/modules/browsers/registry.ts');
+const { recent } = await import('../../../../src/platform/audit.ts');
+const { connectBrowser, disconnectBrowser } = await import('../../support/fakes.ts');
 
 afterEach(() => {
   registry.draining = false;
@@ -24,6 +27,14 @@ const request = (body: any = {}, idempotency?: string) => ({
   headers: { authorization: 'Bearer key-a' },
   body: { provider: 'cdp', ...body },
   get: (name) => (name === 'Idempotency-Key' ? idempotency : undefined),
+});
+
+/** A start request for `key` that names no provider. */
+const startRequest = (key: string, body: any = {}) => ({
+  path: '/start',
+  headers: { authorization: `Bearer ${key}` },
+  body,
+  get: () => undefined,
 });
 
 /** Runs the middleware; resolves with what it answered, or 'next'. */
@@ -69,5 +80,41 @@ describe('admission', () => {
     const req: any = { ...request(), body: {} };
     await admit(req, 'oya-desktop');
     assert.equal(req.controlSession.provider, 'oya-desktop');
+  });
+});
+
+describe('admission of a start nothing can serve', () => {
+  it('refuses it with 409 before reserving, so no session is left behind', async () => {
+    const key = 'key-nothing-to-start';
+    const res = await admit(startRequest(key));
+    assert.equal(res.status, 409);
+    assert.match(res.body.error, /no browser is connected/);
+    assert.deepEqual(await control().sessions(key), []);
+  });
+
+  it('audits the refusal as the handler would have', async () => {
+    await admit(startRequest('key-nothing-audited'));
+    const entry = recent({ action: 'browser.start', outcome: 'error' })[0];
+    assert.equal(entry.meta.provider, 'cdp');
+    assert.match(entry.meta.error, /npx @oya-ai\/cli init/);
+  });
+
+  it('reserves as before once a browser of the key’s is connected', async () => {
+    connectBrowser('desk-1', 'key-with-desktop');
+    try {
+      const req: any = startRequest('key-with-desktop');
+      const { next } = await admit(req);
+      assert.equal(next, true);
+      assert.equal(req.controlSession.state, 'provisioning');
+    } finally {
+      disconnectBrowser('desk-1');
+    }
+  });
+
+  it('reserves a start that names what to dial', async () => {
+    const req: any = startRequest('key-with-url', { provider: 'cdp', wsUrl: 'wss://8.8.8.8/devtools/browser/x' });
+    const { next } = await admit(req);
+    assert.equal(next, true);
+    assert.equal(req.controlSession.provider, 'cdp');
   });
 });

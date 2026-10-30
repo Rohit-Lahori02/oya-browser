@@ -6,6 +6,9 @@ import { Status } from '../../platform/http-status.ts';
 import { BEARER_PREFIX } from './http/constants.ts';
 import { reserve, answerReplay, starting, persistOutcome } from './http/admission.ts';
 import { startAs } from './http/start-as.ts';
+import { nothingToStart } from '../browsers/lifecycle/start-connected.ts';
+import { refusal } from '../browsers/lifecycle/sessions.ts';
+import { audit } from '../../platform/audit.ts';
 
 // Not yet layered: reads the persona and group services from the composition root.
 const { personas, groups } = container;
@@ -30,12 +33,33 @@ export function admission(defaultProvider?) {
 async function admit(key, req, res, next, defaultProvider) {
   if (registry.draining) return res.status(Status.UNAVAILABLE).json({ error: 'Server is draining', code: 'draining' });
   const { provider, target } = await chooseTarget(key, req, defaultProvider);
+  if (refuseUnstartable(key, req, res, provider)) return;
   const reservation = await reserve(key, req, provider, target);
   if (reservation.replay) return answerReplay(key, req, res, reservation);
-  if (reservation.state === 'queued')
-    return res.status(Status.ACCEPTED).json(starting(reservation.id, provider, reservation.persona, 'queued'));
+  if (reservation.state === 'queued') return answerQueued(res, provider, reservation);
   proceed(key, req, res, reservation);
   next();
+}
+
+/** Answers 202: the start is reserved and waits for capacity. */
+function answerQueued(res, provider, reservation) {
+  return res.status(Status.ACCEPTED).json(starting(reservation.id, provider, reservation.persona, 'queued'));
+}
+
+/**
+ * A start that names no provider, has nothing to dial and no browser of the
+ * key's to hand over can only be refused, so it is refused here, before a
+ * session is reserved. Reserved first, it became a failed session with a
+ * provisioning and a failed event behind it, and a webhook call for each, on
+ * every retry of a client that is not set up yet. Audited as the handler would.
+ */
+function refuseUnstartable(key, req, res, provider): boolean {
+  if (!req.path.endsWith('/start')) return false;
+  const err = nothingToStart(req, key, provider);
+  if (!err) return false;
+  audit({ action: 'browser.start', actorKey: key, outcome: 'error', meta: { provider, error: err.message }, req });
+  res.status(err.status).json(refusal(err));
+  return true;
 }
 
 /** The provider to start on and, for a start, what it runs as: a persona, or a group's members. */

@@ -31,6 +31,17 @@ const NOTHING_RUNNING =
   'run `npx @oya-ai/cli init` to pick a provider, ' +
   'or pass wsUrl for a Chrome you started with --remote-debugging-port.';
 
+/**
+ * Why a start that names no provider cannot go ahead: nothing to dial and no
+ * browser of the key's to hand over. Null when either exists. Admission asks
+ * before it reserves a session, so such a start is refused without leaving a
+ * failed session, its two events and a webhook delivery for each behind.
+ */
+export function nothingToStart(req, key: string, wanted: string): HttpError | null {
+  if (!nothingToDial(req, key, wanted) || connected(key)) return null;
+  return new HttpError(Status.CONFLICT, NOTHING_RUNNING);
+}
+
 /** The reply for a browser that was already there. */
 const borrowed = (start: Start, browser, cdpUrl: string) => ({
   id: browser.id,
